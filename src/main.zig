@@ -94,10 +94,10 @@ const Handler = struct {
         var it = dir.iterate();
         while (try it.next()) |entry| {
             if (std.mem.startsWith(u8, entry.name, ".")) continue;
-            switch (entry.kind) {
-                .Directory => try dirs_al.append(try self.arena.allocator.dupe(u8, entry.name)),
-                else => try files_al.append(try self.arena.allocator.dupe(u8, entry.name)),
-            }
+            try (switch (entry.kind) {
+                .Directory => dirs_al,
+                else => files_al,
+            }).append(try self.arena.allocator.dupe(u8, entry.name));
         }
 
         var dirs = dirs_al.toOwnedSlice();
