@@ -58,7 +58,11 @@ const Handler = struct {
         const host = if (indeks) |ix| without_scheme[0..ix] else without_scheme;
         const uri = if (indeks) |ix| without_scheme[ix + 1 ..] else "";
 
-        // XXX: validate no ".." in URI etc.
+        if (std.mem.eql(u8, uri, "..") or
+            std.mem.startsWith(u8, uri, "../") or
+            std.mem.endsWith(u8, uri, "/..") or
+            std.mem.indexOf(u8, uri, "/../") != null)
+            return Result.BAD_REQUEST;
 
         var it = self.config.vhosts.iterator();
         while (it.next()) |entry| {
