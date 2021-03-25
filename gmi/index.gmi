@@ -1,0 +1,5 @@
+# hi
+
+It works :)
+
+=> linked.gmi Here's a relative link.
