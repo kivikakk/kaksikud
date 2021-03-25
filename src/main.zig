@@ -1,6 +1,7 @@
 const std = @import("std");
 const Config = @import("config.zig").Config;
 const resolvePath = @import("resolvePath.zig").resolvePath;
+const mimes = @import("mimes.zig");
 
 const MAX_FILE_SIZE = 10 * 1024 * 1024;
 
@@ -131,9 +132,15 @@ const Handler = struct {
 
     fn maybeReadFile(self: *Handler, dir: std.fs.Dir, path: []const u8) !?Result {
         if (dir.readFileAlloc(&self.arena.allocator, path, MAX_FILE_SIZE)) |s| {
+            const basename = std.fs.path.basename(path);
+            const mime_type = if (std.mem.lastIndexOfScalar(u8, basename, '.')) |ix|
+                mimes.lookup(basename[ix + 1 ..])
+            else
+                null;
+
             return Result{
                 .status = .Success,
-                .meta = "text/gemini", // XXX
+                .meta = mime_type orelse "text/plain",
                 .body = s,
             };
         } else |err| switch (err) {
@@ -173,6 +180,8 @@ pub fn main() !void {
     try serv.listen(try std.net.Address.parseIp(config.bind, config.port));
 
     var work_buf: [1500]u8 = undefined;
+
+    try std.io.getStdOut().writer().print("kaksikud listening on {s}:{}\n", .{ config.bind, config.port });
 
     while (true) {
         var conn = try serv.accept();
