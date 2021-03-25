@@ -3,3 +3,4 @@
 It works :)
 
 => linked.gmi Here's a relative link.
+=> subdir/ Look in a subdirectory.
