@@ -21,6 +21,12 @@ gemini.your.website:
   root: /path/to/root
 ```
 
+## screenshot of it working
+
+![screenshot](screenshot.png)
+
+Viewed in [Lagrange](https://github.com/skyjake/lagrange).
+
 ## warning
 
 If you use any of this in production, I will be so sad.
