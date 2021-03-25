@@ -1,0 +1,42 @@
+#!/usr/bin/env ruby
+
+require 'socket'
+require 'openssl'
+
+ctx = OpenSSL::SSL::SSLContext.new
+ctx.min_version = OpenSSL::SSL::TLS1_1_VERSION
+ctx.max_version = OpenSSL::SSL::TLS1_2_VERSION
+
+cert = OpenSSL::X509::Certificate.new(File.read "cert.pem")
+key = OpenSSL::PKey.read(File.read "key.pem")
+ctx.add_certificate(cert, key)
+
+server = TCPServer.new(1965)
+server = OpenSSL::SSL::SSLServer.new(server, ctx)
+server.listen
+while upstream = server.accept
+  begin
+    downstream = TCPSocket.new('127.0.0.1', 4003)
+  rescue Errno::ECONNREFUSED
+    upstream.close rescue nil
+    next
+  end
+
+  begin
+    while true
+      ready, * = IO.select([upstream, downstream])
+      if ready.include?(upstream)
+        p = upstream.readpartial(1024)
+        downstream.write(p)
+      end
+      if ready.include?(downstream)
+        p = downstream.readpartial(1024)
+        upstream.write(p)
+      end
+    end
+  rescue EOFError
+  end
+
+  downstream.close rescue nil
+  upstream.close rescue nil
+end
