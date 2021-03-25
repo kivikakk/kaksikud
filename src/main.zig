@@ -67,35 +67,68 @@ const Handler = struct {
         var it = self.config.vhosts.iterator();
         while (it.next()) |entry| {
             if (std.mem.eql(u8, entry.key, host)) {
-                var root = try cwd.openDir(entry.value.root, .{});
+                var root = try cwd.openDir(entry.value.root, .{ .iterate = true });
                 defer root.close();
 
-                if (uri.len == 0) return self.handleDir(root, &entry.value);
-                if (root.openDir(uri, .{})) |*subdir| {
+                if (uri.len == 0) return self.handleDir(root, true, &entry.value);
+                if (root.openDir(uri, .{ .iterate = true })) |*subdir| {
                     defer subdir.close();
-                    return self.handleDir(subdir.*, &entry.value);
+                    return self.handleDir(subdir.*, false, &entry.value);
                 } else |err| {}
 
                 if (try self.maybeReadFile(root, uri)) |r| return r;
 
-                return Result{
-                    .status = .NotFound,
-                    .meta = "not found",
-                };
+                return Result.NOT_FOUND;
             }
         }
 
         return Result.NO_MATCHING_VHOST;
     }
 
-    fn handleDir(self: *Handler, dir: std.fs.Dir, vhost: *const Config.VHost) !Result {
+    fn handleDir(self: *Handler, dir: std.fs.Dir, at_root: bool, vhost: *const Config.VHost) !Result {
         if (try self.maybeReadFile(dir, vhost.index)) |r| return r;
+
+        var dirs_al = std.ArrayList([]u8).init(&self.arena.allocator);
+        var files_al = std.ArrayList([]u8).init(&self.arena.allocator);
+
+        var it = dir.iterate();
+        while (try it.next()) |entry| {
+            if (std.mem.startsWith(u8, entry.name, ".")) continue;
+            switch (entry.kind) {
+                .Directory => try dirs_al.append(try self.arena.allocator.dupe(u8, entry.name)),
+                else => try files_al.append(try self.arena.allocator.dupe(u8, entry.name)),
+            }
+        }
+
+        var dirs = dirs_al.toOwnedSlice();
+        std.sort.sort([]u8, dirs, {}, sortFn);
+        var files = files_al.toOwnedSlice();
+        std.sort.sort([]u8, files, {}, sortFn);
+
+        var buf = try std.ArrayList(u8).initCapacity(&self.arena.allocator, 4096);
+        if (!at_root) try buf.appendSlice("=> .. ../\r\n");
+
+        for (dirs) |name| {
+            try buf.appendSlice("=> ");
+            try buf.appendSlice(name);
+            try buf.appendSlice("/\r\n");
+        }
+
+        for (files) |name| {
+            try buf.appendSlice("=> ");
+            try buf.appendSlice(name);
+            try buf.appendSlice("\r\n");
+        }
 
         return Result{
             .status = .Success,
-            .meta = "text/gemini", // XXX
-            .body = "todo: dir listing",
+            .meta = "text/gemini",
+            .body = buf.toOwnedSlice(),
         };
+    }
+
+    fn sortFn(_: void, lhs: []const u8, rhs: []const u8) bool {
+        return std.mem.lessThan(u8, lhs, rhs);
     }
 
     fn maybeReadFile(self: *Handler, dir: std.fs.Dir, path: []const u8) !?Result {
@@ -120,6 +153,7 @@ const Handler = struct {
         const NO_NON_GEMINI: Result = .{ .status = .ProxyRequestRefused, .meta = "no non-gemini requests" };
         const NO_MATCHING_VHOST: Result = .{ .status = .ProxyRequestRefused, .meta = "no matching vhost" };
         const BAD_REQUEST: Result = .{ .status = .BadRequest, .meta = "bad request" };
+        const NOT_FOUND: Result = .{ .status = .NotFound, .meta = "not found" };
     };
 };
 
