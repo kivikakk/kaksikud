@@ -1,6 +1,8 @@
 const std = @import("std");
 const Config = @import("config.zig").Config;
 
+const MAX_FILE_SIZE = 10 * 1024 * 1024;
+
 const GeminiStatus = enum(u8) {
     Input = 10,
     SensitiveInput = 11,
@@ -30,38 +32,92 @@ fn readCrLf(in: anytype, buf: []u8) ?[]u8 {
     return line[0 .. line.len - 1];
 }
 
-const HandleResult = struct {
-    status: GeminiStatus,
-    meta: []const u8,
-    body: ?[]const u8 = null,
+const Handler = struct {
+    arena: std.heap.ArenaAllocator,
+    config: *const Config,
 
-    const NO_NON_GEMINI: HandleResult = .{ .status = .ProxyRequestRefused, .meta = "no non-gemini requests" };
-    const NO_MATCHING_VHOST: HandleResult = .{ .status = .ProxyRequestRefused, .meta = "no matching vhost" };
-    const BAD_REQUEST: HandleResult = .{ .status = .BadRequest, .meta = "bad request" };
-};
-
-fn handle(config: *const Config, url: []const u8) HandleResult {
-    if (!std.mem.startsWith(u8, url, "gemini://")) {
-        return HandleResult.NO_NON_GEMINI;
+    pub fn init(config: *const Config) Handler {
+        return .{
+            .arena = std.heap.ArenaAllocator.init(std.heap.page_allocator),
+            .config = config,
+        };
     }
 
-    const without_scheme = url["gemini://".len..];
-    const indeks = std.mem.indexOf(u8, without_scheme, "/") orelse return HandleResult.BAD_REQUEST;
-    const host = without_scheme[0..indeks];
+    pub fn deinit(self: *Handler) void {
+        self.arena.deinit();
+    }
 
-    var it = config.vhosts.iterator();
-    while (it.next()) |entry| {
-        if (std.mem.eql(u8, entry.key, host)) {
-            return .{
+    pub fn handle(self: *Handler, url: []const u8) !Result {
+        const cwd = std.fs.cwd();
+
+        if (!std.mem.startsWith(u8, url, "gemini://"))
+            return Result.NO_NON_GEMINI;
+
+        const without_scheme = url["gemini://".len..];
+        const indeks = std.mem.indexOf(u8, without_scheme, "/");
+        const host = if (indeks) |ix| without_scheme[0..ix] else without_scheme;
+        const uri = if (indeks) |ix| without_scheme[ix + 1 ..] else "";
+
+        // XXX: validate no ".." in URI etc.
+
+        var it = self.config.vhosts.iterator();
+        while (it.next()) |entry| {
+            if (std.mem.eql(u8, entry.key, host)) {
+                var root = try cwd.openDir(entry.value.root, .{});
+                defer root.close();
+
+                if (uri.len == 0) return self.handleDir(root, &entry.value);
+                if (root.openDir(uri, .{})) |*subdir| {
+                    defer subdir.close();
+                    return self.handleDir(subdir.*, &entry.value);
+                } else |err| {}
+
+                if (try self.maybeReadFile(root, uri)) |r| return r;
+
+                return Result{
+                    .status = .NotFound,
+                    .meta = "not found",
+                };
+            }
+        }
+
+        return Result.NO_MATCHING_VHOST;
+    }
+
+    fn handleDir(self: *Handler, dir: std.fs.Dir, vhost: *const Config.VHost) !Result {
+        if (try self.maybeReadFile(dir, vhost.index)) |r| return r;
+
+        return Result{
+            .status = .Success,
+            .meta = "text/gemini", // XXX
+            .body = "todo: dir listing",
+        };
+    }
+
+    fn maybeReadFile(self: *Handler, dir: std.fs.Dir, path: []const u8) !?Result {
+        if (dir.readFileAlloc(&self.arena.allocator, path, MAX_FILE_SIZE)) |s| {
+            return Result{
                 .status = .Success,
-                .meta = "text/gemini",
-                .body = "# tere, maailma!!\r\n",
+                .meta = "text/gemini", // XXX
+                .body = s,
             };
+        } else |err| switch (err) {
+            error.FileNotFound => return null,
+            else => return err,
         }
     }
 
-    return .{ .status = .ProxyRequestRefused, .meta = "no matching vhost" };
-}
+    const Result = struct {
+        status: GeminiStatus,
+        meta: []const u8,
+        body: ?[]const u8 = null,
+
+        const TEMPORARY_FAILURE: Result = .{ .status = .TemporaryFailure, .meta = "internal error" };
+        const NO_NON_GEMINI: Result = .{ .status = .ProxyRequestRefused, .meta = "no non-gemini requests" };
+        const NO_MATCHING_VHOST: Result = .{ .status = .ProxyRequestRefused, .meta = "no matching vhost" };
+        const BAD_REQUEST: Result = .{ .status = .BadRequest, .meta = "bad request" };
+    };
+};
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -78,7 +134,7 @@ pub fn main() !void {
         .reuse_address = true,
     });
     defer serv.deinit();
-    try serv.listen(try std.net.Address.parseIp4("127.0.0.1", 4003));
+    try serv.listen(try std.net.Address.parseIp(config.bind, config.port));
 
     var work_buf: [1500]u8 = undefined;
 
@@ -89,28 +145,13 @@ pub fn main() !void {
         var in = conn.stream.reader();
         var out = conn.stream.writer();
 
-        // <URL> is a UTF-8 encoded absolute URL, including a scheme, of
-        // maximum length 1024 bytes.
         const url = readCrLf(in, &work_buf) orelse continue;
 
-        const result = handle(&config, url);
-        std.debug.print("{s} -> {s} {s}\n", .{ url, @tagName(result.status), result.meta });
+        var handler = Handler.init(&config);
+        defer handler.deinit();
 
-        // <STATUS><SPACE><META><CR><LF>
-        //
-        // <STATUS> is a two-digit numeric status code, as described below in
-        // 3.2 and in Appendix 1.
-        //
-        // <SPACE> is a single space character, i.e. the byte 0x20.
-        //
-        // <META> is a UTF-8 encoded string of maximum length 1024 bytes, whose
-        // meaning is <STATUS> dependent.
-        //
-        // <STATUS> and <META> are separated by a single space character.
-        //
-        // If <STATUS> does not belong to the "SUCCESS" range of codes, then
-        // the server MUST close the connection after sending the header and
-        // MUST NOT send a response body.
+        const result = handler.handle(url) catch |err| Handler.Result.TEMPORARY_FAILURE;
+        std.debug.print("{s} -> {s} {s}\n", .{ url, @tagName(result.status), result.meta });
 
         out.print("{} {s}\r\n", .{ @enumToInt(result.status), result.meta }) catch continue;
 

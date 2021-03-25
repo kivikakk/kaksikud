@@ -1,3 +1,6 @@
+bind: 127.0.0.1
+port: 4003
+
 localhost:
   root: gmi
 
