@@ -1,4 +1,5 @@
 const std = @import("std");
+const Config = @import("config.zig").Config;
 
 const GeminiStatus = enum(u8) {
     Input = 10,
@@ -29,30 +30,50 @@ fn readCrLf(in: anytype, buf: []u8) ?[]u8 {
     return line[0 .. line.len - 1];
 }
 
-const valid_url_prefix = "gemini://localhost/";
-
 const HandleResult = struct {
     status: GeminiStatus,
     meta: []const u8,
     body: ?[]const u8 = null,
+
+    const NO_NON_GEMINI: HandleResult = .{ .status = .ProxyRequestRefused, .meta = "no non-gemini requests" };
+    const NO_MATCHING_VHOST: HandleResult = .{ .status = .ProxyRequestRefused, .meta = "no matching vhost" };
+    const BAD_REQUEST: HandleResult = .{ .status = .BadRequest, .meta = "bad request" };
 };
 
-fn handle(url: []const u8) HandleResult {
-    if (!std.mem.startsWith(u8, url, valid_url_prefix)) {
-        return .{
-            .status = .ProxyRequestRefused,
-            .meta = "only serves " ++ valid_url_prefix,
-        };
+fn handle(config: *const Config, url: []const u8) HandleResult {
+    if (!std.mem.startsWith(u8, url, "gemini://")) {
+        return HandleResult.NO_NON_GEMINI;
     }
 
-    return .{
-        .status = .Success,
-        .meta = "text/gemini",
-        .body = "# tere, maailma!\r\n",
-    };
+    const without_scheme = url["gemini://".len..];
+    const indeks = std.mem.indexOf(u8, without_scheme, "/") orelse return HandleResult.BAD_REQUEST;
+    const host = without_scheme[0..indeks];
+
+    var it = config.vhosts.iterator();
+    while (it.next()) |entry| {
+        if (std.mem.eql(u8, entry.key, host)) {
+            return .{
+                .status = .Success,
+                .meta = "text/gemini",
+                .body = "# tere, maailma!!\r\n",
+            };
+        }
+    }
+
+    return .{ .status = .ProxyRequestRefused, .meta = "no matching vhost" };
 }
 
 pub fn main() !void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+
+    var config = blk: {
+        var raw_config = try std.fs.cwd().readFileAlloc(&gpa.allocator, "config.zzz", 1024 * 100);
+        errdefer gpa.allocator.free(raw_config);
+        break :blk try Config.init(&gpa.allocator, raw_config);
+    };
+    defer config.deinit();
+
     var serv = std.net.StreamServer.init(.{
         .reuse_address = true,
     });
@@ -71,9 +92,9 @@ pub fn main() !void {
         // <URL> is a UTF-8 encoded absolute URL, including a scheme, of
         // maximum length 1024 bytes.
         const url = readCrLf(in, &work_buf) orelse continue;
-        std.debug.print("url: '{s}'\n", .{url});
 
-        const result = handle(url);
+        const result = handle(&config, url);
+        std.debug.print("{s} -> {s} {s}\n", .{ url, @tagName(result.status), result.meta });
 
         // <STATUS><SPACE><META><CR><LF>
         //

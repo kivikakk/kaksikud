@@ -15,12 +15,15 @@ server = TCPServer.new(1965)
 server = OpenSSL::SSL::SSLServer.new(server, ctx)
 server.listen
 while upstream = server.accept
+  print "accepted upstream ..."
   begin
     downstream = TCPSocket.new('127.0.0.1', 4003)
   rescue Errno::ECONNREFUSED
     upstream.close rescue nil
+    puts " failed to connect downstream."
     next
   end
+  puts " connected downstream."
 
   begin
     while true
@@ -35,6 +38,7 @@ while upstream = server.accept
       end
     end
   rescue EOFError
+    puts "got eof."
   end
 
   downstream.close rescue nil

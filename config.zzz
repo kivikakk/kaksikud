@@ -1,0 +1,5 @@
+localhost:
+  root: gmi
+
+127.0.0.1:
+  root: elsewhere
