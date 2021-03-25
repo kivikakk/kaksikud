@@ -1,5 +1,6 @@
 const std = @import("std");
 const Config = @import("config.zig").Config;
+const resolvePath = @import("resolvePath.zig").resolvePath;
 
 const MAX_FILE_SIZE = 10 * 1024 * 1024;
 
@@ -56,13 +57,10 @@ const Handler = struct {
         const without_scheme = url["gemini://".len..];
         const indeks = std.mem.indexOf(u8, without_scheme, "/");
         const host = if (indeks) |ix| without_scheme[0..ix] else without_scheme;
-        const uri = if (indeks) |ix| without_scheme[ix + 1 ..] else "";
+        const dangerous_uri = if (indeks) |ix| without_scheme[ix + 1 ..] else "";
 
-        if (std.mem.eql(u8, uri, "..") or
-            std.mem.startsWith(u8, uri, "../") or
-            std.mem.endsWith(u8, uri, "/..") or
-            std.mem.indexOf(u8, uri, "/../") != null)
-            return Result.BAD_REQUEST;
+        var path_buffer: [1024]u8 = undefined;
+        const path = (try resolvePath(&path_buffer, dangerous_uri))[1..];
 
         var it = self.config.vhosts.iterator();
         while (it.next()) |entry| {
@@ -70,13 +68,13 @@ const Handler = struct {
                 var root = try cwd.openDir(entry.value.root, .{ .iterate = true });
                 defer root.close();
 
-                if (uri.len == 0) return self.handleDir(root, true, &entry.value);
-                if (root.openDir(uri, .{ .iterate = true })) |*subdir| {
+                if (path.len == 0) return self.handleDir(root, true, &entry.value);
+                if (root.openDir(path, .{ .iterate = true })) |*subdir| {
                     defer subdir.close();
                     return self.handleDir(subdir.*, false, &entry.value);
                 } else |err| {}
 
-                if (try self.maybeReadFile(root, uri)) |r| return r;
+                if (try self.maybeReadFile(root, path)) |r| return r;
 
                 return Result.NOT_FOUND;
             }
@@ -190,7 +188,6 @@ pub fn main() !void {
 
         const result = handler.handle(url) catch |err| Handler.Result.TEMPORARY_FAILURE;
         std.debug.print("{s} -> {s} {s}\n", .{ url, @tagName(result.status), result.meta });
-
         out.print("{} {s}\r\n", .{ @enumToInt(result.status), result.meta }) catch continue;
 
         if (result.body) |body| {
