@@ -128,7 +128,9 @@ usingnamespace if (std.io.is_async)
             }
             finished_clients.items.len = 0;
         }
-    };
+    }
+else
+    struct {};
 
 fn handleConnection(config: *Config, connection: std.net.StreamServer.Connection) void {
     var context = Server.readRequest(connection) catch |err| {
@@ -172,6 +174,12 @@ pub fn main() !void {
         finished_clients = std.ArrayList(*AsyncClient).init(allocator);
     }
     defer if (std.io.is_async) {
+        var it = clients.iterator();
+        while (it.next()) |client| {
+            await client.key.frame;
+        }
+        cleanupFinished(allocator);
+
         finished_clients.deinit();
         clients.deinit();
     };
@@ -193,10 +201,4 @@ pub fn main() !void {
             handleConnection(&config, connection);
         }
     }
-
-    var it = clients.iterator();
-    while (it.next()) |client| {
-        await client.key.frame;
-    }
-    cleanupFinished(allocator);
 }
