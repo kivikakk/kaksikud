@@ -3,6 +3,8 @@ const Server = @import("server.zig").Server;
 const Config = @import("config.zig").Config;
 const mimes = @import("mimes.zig");
 
+pub const io_mode = .evented;
+
 const Handler = struct {
     const MAX_FILE_SIZE = 10 * 1024 * 1024;
 
@@ -103,14 +105,60 @@ const Handler = struct {
     }
 };
 
+const AsyncClient = struct {
+    frame: @Frame(handle),
+
+    fn handle(self: *AsyncClient, config: *Config, connection: std.net.StreamServer.Connection) void {
+        handleConnection(config, connection);
+        finished_clients.append(self) catch |err| {
+            std.debug.print("handle: error appending to finished_clients: {}\n", .{err});
+        };
+    }
+};
+
+fn handleConnection(config: *Config, connection: std.net.StreamServer.Connection) void {
+    var context = Server.readRequest(connection) catch |err| {
+        std.debug.print("readRequest failed: {}\n", .{err});
+        connection.stream.close();
+        return;
+    };
+    defer context.deinit();
+
+    Handler.handle(config, &context) catch |err| {
+        std.debug.print("{s} -> {}\n", .{ context.request.original_url, err });
+        return;
+    };
+
+    std.debug.print("{s} -> {s} {s}\n", .{ context.request.original_url, @tagName(context.response_status.code), context.response_status.meta });
+}
+
+usingnamespace if (std.io.is_async)
+    struct {
+        pub var clients: std.AutoHashMap(*AsyncClient, void) = undefined;
+        pub var finished_clients: std.ArrayList(*AsyncClient) = undefined;
+
+        pub fn cleanupFinished(allocator: *std.mem.Allocator) void {
+            for (finished_clients.items) |fin| {
+                _ = clients.remove(fin);
+                allocator.destroy(fin);
+            }
+            finished_clients.items.len = 0;
+        }
+    };
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
 
+    var allocator = &gpa.allocator;
+
+    try mimes.init(allocator);
+    defer mimes.deinit(allocator);
+
     var config = blk: {
-        var raw_config = try std.fs.cwd().readFileAlloc(&gpa.allocator, "config.zzz", 1024 * 100);
+        var raw_config = try std.fs.cwd().readFileAlloc(allocator, "config.zzz", 1024 * 100);
         errdefer gpa.allocator.free(raw_config);
-        break :blk try Config.init(&gpa.allocator, raw_config);
+        break :blk try Config.init(allocator, raw_config);
     };
     defer config.deinit();
 
@@ -119,14 +167,41 @@ pub fn main() !void {
 
     try std.io.getStdOut().writer().print("kaksikud listening on {s}:{}\n", .{ config.bind, config.port });
 
-    while (true) {
-        var context = try server.getContext();
-        defer context.deinit();
+    if (std.io.is_async) {
+        clients = std.AutoHashMap(*AsyncClient, void).init(allocator);
+        finished_clients = std.ArrayList(*AsyncClient).init(allocator);
+    }
+    defer if (std.io.is_async) {
+        finished_clients.deinit();
+        clients.deinit();
+    };
 
-        Handler.handle(&config, &context) catch |err| {
-            std.debug.print("{s} -> {}\n", .{ context.request.original_url, err });
+    var i: usize = 3;
+    while (i > 0) : (i -= 1) {
+        var connection = server.getConnection() catch |err| {
+            std.debug.print("getConnection failed: {}\n", .{err});
             continue;
         };
-        std.debug.print("{s} -> {s} {s}\n", .{ context.request.original_url, @tagName(context.response_status.code), context.response_status.meta });
+
+        if (std.io.is_async) {
+            cleanupFinished(allocator);
+            var client = try allocator.create(AsyncClient);
+            client.* = .{
+                .frame = async client.handle(&config, connection),
+            };
+            try clients.putNoClobber(client, {});
+        } else {
+            handleConnection(&config, connection);
+        }
     }
+
+    std.debug.print("awaiting\n", .{});
+
+    var it = clients.iterator();
+    while (it.next()) |client| {
+        await client.key.frame;
+    }
+    cleanupFinished(allocator);
+
+    std.debug.print("fin\n", .{});
 }

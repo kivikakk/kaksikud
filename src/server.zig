@@ -20,10 +20,11 @@ pub const Server = struct {
         self.server.deinit();
     }
 
-    pub fn getContext(self: *Server) !Context {
-        var connection = try self.server.accept();
-        errdefer connection.stream.close();
+    pub fn getConnection(self: *Server) !std.net.StreamServer.Connection {
+        return self.server.accept();
+    }
 
+    pub fn readRequest(connection: std.net.StreamServer.Connection) !Context {
         var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
         errdefer arena.deinit();
 
@@ -76,10 +77,9 @@ pub const Server = struct {
         headers_written: bool,
 
         pub fn deinit(self: *Context) void {
-            defer self.arena.deinit();
-            defer self.connection.stream.close();
-
             self.ensureResponseStatusWritten() catch {};
+            self.connection.stream.close();
+            self.arena.deinit();
         }
 
         pub fn status(self: *Context, response_status: ResponseStatus) void {
