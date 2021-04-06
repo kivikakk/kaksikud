@@ -9,6 +9,10 @@ pub const Config = struct {
     port: u16,
     vhosts: std.StringHashMap(VHost),
 
+    // Only used in evented mode.
+    client_timeout_seconds: u32 = 10,
+    max_concurrent_clients: usize = 128,
+
     pub const VHost = struct {
         root: []const u8,
         index: []const u8,

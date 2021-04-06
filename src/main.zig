@@ -3,6 +3,8 @@ const Server = @import("server.zig").Server;
 const Config = @import("config.zig").Config;
 const mimes = @import("mimes.zig");
 
+pub const io_mode = .evented;
+
 const Handler = struct {
     const MAX_FILE_SIZE = 10 * 1024 * 1024;
 
@@ -103,14 +105,121 @@ const Handler = struct {
     }
 };
 
+usingnamespace if (std.io.is_async)
+    struct {
+        pub const AsyncClient = struct {
+            config: *Config,
+            connection: std.net.StreamServer.Connection,
+
+            handle_frame: @Frame(handle) = undefined,
+            timeout_frame: @Frame(timeout) = undefined,
+
+            status: enum { started, finished, hit_timeout, finish_pushed } = .started,
+
+            pub fn create(allocator: *std.mem.Allocator, config: *Config, connection: std.net.StreamServer.Connection) !*AsyncClient {
+                var self = try allocator.create(AsyncClient);
+                self.* = .{ .config = config, .connection = connection };
+                self.handle_frame = async self.handle();
+                self.timeout_frame = async self.timeout();
+                return self;
+            }
+
+            fn handle(self: *AsyncClient) void {
+                handleConnection(self.config, self.connection);
+                // State transitions for post-handle:
+                // * started -> finished           (We completed work here; signal timeout frame to exit)
+                // * finished -X                   (Only we should set this here)
+                // * hit_timeout -> finish_pushed  (Timeout was hit and connection force-closed for us; exit)
+                // * finish_pushed -X              (We should never observe this; implies our frame was dealloced)
+                switch (self.status) {
+                    .started => self.status = .finished,
+                    .hit_timeout => return self.finished(),
+                    else => unreachable,
+                }
+            }
+
+            fn timeout(self: *AsyncClient) void {
+                var seconds_remaining: usize = self.config.client_timeout_seconds;
+                while (seconds_remaining > 0) : (seconds_remaining -= 1) {
+                    std.event.Loop.instance.?.sleep(1 * std.time.ns_per_s);
+                    // State transitions for mid-timeout loop:
+                    // * started -> started         (Still working ...)
+                    // * finished -> finish_pushed  (Normal completion, exit)
+                    // * hit_timeout -X             (Only we should set this later)
+                    // * finish_pushed -X           (We should never observe this; implies our frame was dealloced)
+                    switch (self.status) {
+                        .started => {},
+                        .finished => return self.finished(),
+                        else => unreachable,
+                    }
+                }
+
+                // State transitions for post-timeout:
+                // * started -> hit_timeout    (Signal handle frame that we've exited here; kill connection)
+                // * finished -X               (This should've been handled above, as execution proceeds straight down)
+                // * hit_timeout -X            (Only we should set this here)
+                // * finish_pushed -X          (We should never observe this; implies our frame was dealloced)
+                switch (self.status) {
+                    .started => {
+                        std.debug.print("timeout handling request\n", .{});
+                        self.status = .hit_timeout;
+                        std.os.shutdown(self.connection.stream.handle, .both) catch {};
+                    },
+                    else => unreachable,
+                }
+            }
+
+            fn finished(self: *AsyncClient) void {
+                self.status = .finish_pushed;
+                finished_clients.append(self) catch |err| {
+                    std.debug.print("{*}: finished(): error appending to finished_clients: {}\n", .{ self, err });
+                };
+            }
+        };
+
+        pub var clients: std.AutoHashMap(*AsyncClient, void) = undefined;
+        pub var finished_clients: std.ArrayList(*AsyncClient) = undefined;
+
+        pub fn cleanupFinished(allocator: *std.mem.Allocator) void {
+            for (finished_clients.items) |fin| {
+                _ = clients.remove(fin);
+                allocator.destroy(fin);
+            }
+            finished_clients.items.len = 0;
+        }
+    }
+else
+    struct {};
+
+fn handleConnection(config: *Config, connection: std.net.StreamServer.Connection) void {
+    var context = Server.readRequest(connection) catch |err| {
+        std.debug.print("readRequest failed: {}\n", .{err});
+        connection.stream.close();
+        return;
+    };
+    defer context.deinit();
+
+    Handler.handle(config, &context) catch |err| {
+        std.debug.print("{s} -> {}\n", .{ context.request.original_url, err });
+        return;
+    };
+
+    std.debug.print("{s} -> {s} {s}\n", .{ context.request.original_url, @tagName(context.response_status.code), context.response_status.meta });
+}
+
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
 
+    var allocator = &gpa.allocator;
+
+    try mimes.init(allocator);
+    defer mimes.deinit(allocator);
+
     var config = blk: {
-        var raw_config = try std.fs.cwd().readFileAlloc(&gpa.allocator, "config.zzz", 1024 * 100);
+        var raw_config = try std.fs.cwd().readFileAlloc(allocator, "config.zzz", 1024 * 100);
         errdefer gpa.allocator.free(raw_config);
-        break :blk try Config.init(&gpa.allocator, raw_config);
+        break :blk try Config.init(allocator, raw_config);
     };
     defer config.deinit();
 
@@ -119,14 +228,38 @@ pub fn main() !void {
 
     try std.io.getStdOut().writer().print("kaksikud listening on {s}:{}\n", .{ config.bind, config.port });
 
-    while (true) {
-        var context = try server.getContext();
-        defer context.deinit();
+    if (std.io.is_async) {
+        clients = std.AutoHashMap(*AsyncClient, void).init(allocator);
+        finished_clients = std.ArrayList(*AsyncClient).init(allocator);
+    }
+    defer if (std.io.is_async) {
+        var it = clients.iterator();
+        while (it.next()) |entry| {
+            await entry.key.handle_frame;
+            await entry.key.timeout_frame;
+        }
+        cleanupFinished(allocator);
 
-        Handler.handle(&config, &context) catch |err| {
-            std.debug.print("{s} -> {}\n", .{ context.request.original_url, err });
+        finished_clients.deinit();
+        clients.deinit();
+    };
+
+    while (true) {
+        var connection = server.getConnection() catch |err| {
+            std.debug.print("getConnection failed: {}\n", .{err});
             continue;
         };
-        std.debug.print("{s} -> {s} {s}\n", .{ context.request.original_url, @tagName(context.response_status.code), context.response_status.meta });
+
+        if (std.io.is_async) {
+            cleanupFinished(allocator);
+            if (clients.count() >= config.max_concurrent_clients) {
+                connection.stream.close();
+                continue;
+            }
+            var client = try AsyncClient.create(allocator, &config, connection);
+            try clients.putNoClobber(client, {});
+        } else {
+            handleConnection(&config, connection);
+        }
     }
 }
