@@ -126,6 +126,11 @@ usingnamespace if (std.io.is_async)
 
             fn handle(self: *AsyncClient) void {
                 handleConnection(self.config, self.connection);
+                // State transitions for post-handle:
+                // * started -> finished           (We completed work here; signal timeout frame to exit)
+                // * finished -X                   (Only we should set this here)
+                // * hit_timeout -> finish_pushed  (Timeout was hit and connection force-closed for us; exit)
+                // * finish_pushed -X              (We should never observe this; implies our frame was dealloced)
                 switch (self.status) {
                     .started => {
                         self.status = .finished;
@@ -143,16 +148,34 @@ usingnamespace if (std.io.is_async)
                 var seconds_remaining: usize = self.config.client_timeout_seconds;
                 while (seconds_remaining > 0) : (seconds_remaining -= 1) {
                     std.event.Loop.instance.?.sleep(1 * std.time.ns_per_s);
-                    if (self.status == .finished) {
-                        std.debug.print("{*}: timeout(): frame aborting per signal\n", .{self});
-                        return self.finished();
+                    // State transitions for mid-timeout loop:
+                    // * started -> started         (Still working ...)
+                    // * finished -> finish_pushed  (Normal completion, exit)
+                    // * hit_timeout -X             (Only we should set this later)
+                    // * finish_pushed -X           (We should never observe this; implies our frame was dealloced)
+                    switch (self.status) {
+                        .started => {},
+                        .finished => {
+                            std.debug.print("{*}: timeout(): frame aborting per signal\n", .{self});
+                            return self.finished();
+                        },
+                        else => unreachable,
                     }
                     std.debug.print("{*}: timeout(): tick ...\n", .{self});
                 }
-                if (self.status == .started) {
-                    self.status = .hit_timeout;
-                    std.debug.print("{*}: timeout(): hit timeout proper\n", .{self});
-                    self.connection.stream.close();
+
+                // State transitions for post-timeout:
+                // * started -> hit_timeout    (Signal handle frame that we've exited here; kill connection)
+                // * finished -X               (This should've been handled above, as execution proceeds straight down)
+                // * hit_timeout -X            (Only we should set this here)
+                // * finish_pushed -X          (We should never observe this; implies our frame was dealloced)
+                switch (self.status) {
+                    .started => {
+                        self.status = .hit_timeout;
+                        std.debug.print("{*}: timeout(): hit timeout proper\n", .{self});
+                        self.connection.stream.close();
+                    },
+                    else => unreachable,
                 }
             }
 
