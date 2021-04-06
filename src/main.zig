@@ -105,16 +105,30 @@ const Handler = struct {
     }
 };
 
-const AsyncClient = struct {
-    frame: @Frame(handle),
+usingnamespace if (std.io.is_async)
+    struct {
+        pub const AsyncClient = struct {
+            frame: @Frame(handle),
 
-    fn handle(self: *AsyncClient, config: *Config, connection: std.net.StreamServer.Connection) void {
-        handleConnection(config, connection);
-        finished_clients.append(self) catch |err| {
-            std.debug.print("handle: error appending to finished_clients: {}\n", .{err});
+            fn handle(self: *AsyncClient, config: *Config, connection: std.net.StreamServer.Connection) void {
+                handleConnection(config, connection);
+                finished_clients.append(self) catch |err| {
+                    std.debug.print("handle: error appending to finished_clients: {}\n", .{err});
+                };
+            }
         };
-    }
-};
+
+        pub var clients: std.AutoHashMap(*AsyncClient, void) = undefined;
+        pub var finished_clients: std.ArrayList(*AsyncClient) = undefined;
+
+        pub fn cleanupFinished(allocator: *std.mem.Allocator) void {
+            for (finished_clients.items) |fin| {
+                _ = clients.remove(fin);
+                allocator.destroy(fin);
+            }
+            finished_clients.items.len = 0;
+        }
+    };
 
 fn handleConnection(config: *Config, connection: std.net.StreamServer.Connection) void {
     var context = Server.readRequest(connection) catch |err| {
@@ -131,20 +145,6 @@ fn handleConnection(config: *Config, connection: std.net.StreamServer.Connection
 
     std.debug.print("{s} -> {s} {s}\n", .{ context.request.original_url, @tagName(context.response_status.code), context.response_status.meta });
 }
-
-usingnamespace if (std.io.is_async)
-    struct {
-        pub var clients: std.AutoHashMap(*AsyncClient, void) = undefined;
-        pub var finished_clients: std.ArrayList(*AsyncClient) = undefined;
-
-        pub fn cleanupFinished(allocator: *std.mem.Allocator) void {
-            for (finished_clients.items) |fin| {
-                _ = clients.remove(fin);
-                allocator.destroy(fin);
-            }
-            finished_clients.items.len = 0;
-        }
-    };
 
 pub fn main() !void {
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
@@ -176,8 +176,7 @@ pub fn main() !void {
         clients.deinit();
     };
 
-    var i: usize = 3;
-    while (i > 0) : (i -= 1) {
+    while (true) {
         var connection = server.getConnection() catch |err| {
             std.debug.print("getConnection failed: {}\n", .{err});
             continue;
@@ -195,13 +194,9 @@ pub fn main() !void {
         }
     }
 
-    std.debug.print("awaiting\n", .{});
-
     var it = clients.iterator();
     while (it.next()) |client| {
         await client.key.frame;
     }
     cleanupFinished(allocator);
-
-    std.debug.print("fin\n", .{});
 }
