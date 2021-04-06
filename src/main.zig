@@ -108,12 +108,58 @@ const Handler = struct {
 usingnamespace if (std.io.is_async)
     struct {
         pub const AsyncClient = struct {
-            frame: @Frame(handle),
+            config: *Config,
+            connection: std.net.StreamServer.Connection,
 
-            fn handle(self: *AsyncClient, config: *Config, connection: std.net.StreamServer.Connection) void {
-                handleConnection(config, connection);
+            handle_frame: @Frame(handle) = undefined,
+            timeout_frame: @Frame(timeout) = undefined,
+
+            status: enum { started, finished, hit_timeout, finish_pushed } = .started,
+
+            pub fn create(allocator: *std.mem.Allocator, config: *Config, connection: std.net.StreamServer.Connection) !*AsyncClient {
+                var self = try allocator.create(AsyncClient);
+                self.* = .{ .config = config, .connection = connection };
+                self.handle_frame = async self.handle();
+                self.timeout_frame = async self.timeout();
+                return self;
+            }
+
+            fn handle(self: *AsyncClient) void {
+                handleConnection(self.config, self.connection);
+                switch (self.status) {
+                    .started => {
+                        self.status = .finished;
+                        std.debug.print("{*}: handle(): signalling timeout frame\n", .{self});
+                    },
+                    .hit_timeout => {
+                        std.debug.print("{*}: handle(): finishing per timeout signal\n", .{self});
+                        return self.finished();
+                    },
+                    else => unreachable,
+                }
+            }
+
+            fn timeout(self: *AsyncClient) void {
+                var seconds_remaining: usize = self.config.client_timeout_seconds;
+                while (seconds_remaining > 0) : (seconds_remaining -= 1) {
+                    std.event.Loop.instance.?.sleep(1 * std.time.ns_per_s);
+                    if (self.status == .finished) {
+                        std.debug.print("{*}: timeout(): frame aborting per signal\n", .{self});
+                        return self.finished();
+                    }
+                    std.debug.print("{*}: timeout(): tick ...\n", .{self});
+                }
+                if (self.status == .started) {
+                    self.status = .hit_timeout;
+                    std.debug.print("{*}: timeout(): hit timeout proper\n", .{self});
+                    self.connection.stream.close();
+                }
+            }
+
+            fn finished(self: *AsyncClient) void {
+                self.status = .finish_pushed;
                 finished_clients.append(self) catch |err| {
-                    std.debug.print("handle: error appending to finished_clients: {}\n", .{err});
+                    std.debug.print("{*}: finished(): error appending to finished_clients: {}\n", .{ self, err });
                 };
             }
         };
@@ -176,7 +222,7 @@ pub fn main() !void {
     defer if (std.io.is_async) {
         var it = clients.iterator();
         while (it.next()) |client| {
-            await client.key.frame;
+            await client.key.handle_frame;
         }
         cleanupFinished(allocator);
 
@@ -192,10 +238,11 @@ pub fn main() !void {
 
         if (std.io.is_async) {
             cleanupFinished(allocator);
-            var client = try allocator.create(AsyncClient);
-            client.* = .{
-                .frame = async client.handle(&config, connection),
-            };
+            if (clients.count() >= config.max_concurrent_clients) {
+                connection.stream.close();
+                continue;
+            }
+            var client = try AsyncClient.create(allocator, &config, connection);
             try clients.putNoClobber(client, {});
         } else {
             handleConnection(&config, connection);
