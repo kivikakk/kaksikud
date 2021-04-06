@@ -173,7 +173,7 @@ usingnamespace if (std.io.is_async)
                     .started => {
                         self.status = .hit_timeout;
                         std.debug.print("{*}: timeout(): hit timeout proper\n", .{self});
-                        self.connection.stream.close();
+                        std.os.shutdown(self.connection.stream.handle, .both) catch {};
                     },
                     else => unreachable,
                 }
