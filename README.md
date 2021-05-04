@@ -31,8 +31,6 @@ Viewed in [Lagrange](https://github.com/skyjake/lagrange).
 
 If you use any of this in production, I will be so sad.
 
-Did I mention it's single-threaded and non-evented?
-
 ## license
 
 Copyright 2021 Asherah Connor, [MIT](./LICENSE)-licensed.
